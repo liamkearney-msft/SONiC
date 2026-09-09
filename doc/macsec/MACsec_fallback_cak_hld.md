@@ -6,6 +6,7 @@
 |  Rev  | Date | Author       | Change Description |
 | :---: | :--: | :----------- | ------------------ |
 |  0.1  |      | Liam Kearney | Initial version    |
+|  0.2  | 2026-09-09 | Liam Kearney | Clarify interoperability assumptions, multi-actor SAK Use, interrupted rollover state, AN selection, and emergency revocation |
 
 <!-- omit in toc -->
 ## Table of Contents
@@ -20,6 +21,7 @@
   - [3.1 Per-port SecY state moves to the KaY](#31-per-port-secy-state-moves-to-the-kay)
   - [3.2 Principal CA selection](#32-principal-ca-selection)
   - [3.3 Hitless failover](#33-hitless-failover)
+    - [3.3.1 Hitless preconditions and interoperability](#331-hitless-preconditions-and-interoperability)
   - [3.4 Deferred post-promotion rekey](#34-deferred-post-promotion-rekey)
   - [3.5 SAK rollover hardening](#35-sak-rollover-hardening)
 - [4 Configuration](#4-configuration)
@@ -28,7 +30,6 @@
 - [5 Interaction with MACsecMgr](#5-interaction-with-macsecmgr)
 - [6 Backward compatibility](#6-backward-compatibility)
 - [7 Test plan](#7-test-plan)
-- [8 Patch series](#8-patch-series)
 
 ## About this Manual
 
@@ -52,9 +53,11 @@ It delivers **Phase III** of that document's functional requirements:
 (`src/pae/`, `wpa_supplicant/`).
 
 **Out of scope** — CONFIG\_DB schema (the `MACSEC_PROFILE` table already carries
-optional `fallback_cak` / `fallback_ckn`), MACsecMgr, the SONiC MACsec plugin,
-MACsecOrch, and SAI. None of these need to change; the feature is confined to
-the MKA control plane and reuses the existing plugin API surface.
+optional `fallback_cak` / `fallback_ckn`), the MACsecMgr hot-rotation workflow,
+the SONiC MACsec plugin, MACsecOrch, and SAI. Static fallback configuration only
+requires MACsecMgr to map the existing fields to the new supplicant parameters.
+Applying a primary CAK update to an already-running port requires the
+delete-then-add orchestration summarized in §5 and is specified separately.
 
 ## Abbreviations
 
@@ -62,7 +65,7 @@ the MKA control plane and reuses the existing plugin API surface.
 | ------------ | -------------------------------------------------------- |
 | CA           | Secure Connectivity Association                          |
 | CAK / CKN    | Connectivity Association Key / CA Key Name               |
-| CP           | Controlled Port state machine (IEEE 802.1X-2010, Cl. 12) |
+| CP           | Controlled Port state machine (IEEE Std 802.1X-2020 §12.4) |
 | KaY          | MACsec Key Agreement Entity                              |
 | KI / KN      | Key Identifier / Key Number                              |
 | MKA          | MACsec Key Agreement protocol                            |
@@ -80,13 +83,16 @@ the MKA control plane and reuses the existing plugin API surface.
    identifies a CA in an MKPDU — though the CAKs may be the same.
 2. If the primary CA fails — typically a key mismatch after a one-sided key
    rotation, or the peer losing the primary CAK — the port **must fail over to
-   the fallback CA without dropping traffic**.
+   the fallback CA without dropping traffic**, subject to the interoperability
+   preconditions in §3.3.1.
 3. The primary CA has **priority** over the fallback: whenever the primary has a
-   live peer and we are key server on it, that is where SAKs are distributed. An
-   in-flight rekey settles first (§3.4), so recovery never cuts one short.
-4. Both ends must end up on the **same** CA. When both CAs have live peers the
-   key server distributes on the primary and the other end follows the CKN its
-   SAKs arrive on, so the two ends cannot oscillate.
+   live peer and we are key server on it, that is where SAKs are distributed.
+   An in-flight rekey keeps its current CP/SecY state across the ownership
+   change; a fresh rekey under the incoming CA is deferred (§3.4).
+4. Both ends must converge on the **same** CA. When one coherent key server
+   drives the port, it distributes on its selected CA and the non-key-server
+   follows the CKN carrying the Distributed SAK. Operators must configure
+   key-server priority consistently across both CAs (§3.2).
 5. The feature must be **opt-in**. With only a primary CAK configured, behaviour
    is unchanged.
 6. A CAK must be replaceable **at runtime**, without restarting the supplicant
@@ -201,12 +207,19 @@ flowchart TD
   J --> L
 ```
 
-Selection is not key server election: election happens inside each CA and is an
-input here. As key server we choose, and we prefer the primary; as a non key
-server we choose nothing — rule 2 keeps whichever CA the remote key server is
-distributing on. Only one end decides, so the two cannot ping-pong between CKNs.
-Election is re-run for the incoming CA on promotion, but key server priority and
-SCI are port properties, so every CA reaches the same verdict.
+Selection is not key server election: election happens independently inside
+each CA and is an input here. As key server we choose, and we prefer the
+primary; as a non-key-server we follow a validated Distributed SAK on the CA
+chosen by the remote key server.
+
+SONiC advertises the same port-level key-server priority and SCI on both CAs.
+When the same two actors are live and configured consistently, both per-CA
+elections therefore reach the same result. That result is not guaranteed by the
+protocol when CA membership differs transiently or a peer advertises different
+parameters per CKN. Consistent key-server priority configuration is an operator
+requirement: the hitless design assumes one coherent key server drives the port
+across both CAs. If the endpoints become key server on different CAs, each can
+select a different principal and the no-oscillation guarantee no longer applies.
 
 "Active" is close to "configured": the flag is set once a CA sends or processes
 an MKPDU and cleared only when the CA is deleted or deactivated. It is not a
@@ -220,27 +233,72 @@ down as upstream does: the SAs are deleted and the controlled port is blocked,
 while the owner pointer is retained. The returning peer re-elects and the port
 re-secures on a freshly distributed SAK.
 
-Two safety rules complete the picture:
+Three safety rules complete the picture:
 
 - A `Distributed SAK` is validated **entirely within the receiving CA** before it
   is allowed to touch the CP, so a SAK arriving on the fallback CA cannot
   install key material for the port it does not own.
-- Only the **principal** key server distributes SAKs. A rekey requested on a
-  non key server is retained (and honoured on promotion) rather than silently
-  dropped.
+- Only the **principal** key server distributes SAKs. An explicit
+  `macsec_rekey` request is rejected when the principal is not key server,
+  rather than returning success for a request that cannot be acted on locally.
+- Once a SAK is in use, every live actor sends a full 40-byte SAK-Use body
+  (IEEE Std 802.1X-2020 §9.10.1). Only the principal sends nonzero latest/old
+  key state; a standby clears those fields and reports only the shared PTx/PRx
+  status (IEEE Std 802.1X-2020 §12.2).
+
+```mermaid
+sequenceDiagram
+  participant SEC as Shared CP / SecY
+  participant PRI as Primary actor / CKN
+  participant FB as Fallback actor / CKN
+  participant PEER as Peer
+
+  Note over SEC,PEER: primary is principal
+  SEC-->>PRI: latest / old key state
+  PRI->>PEER: full SAK-Use<br/>KI, AN, RX/TX, LPN, DP = shared state<br/>PTx/PRx = shared status
+  FB->>PEER: full SAK-Use<br/>key-state fields = 0<br/>PTx/PRx = shared status
+
+  Note over SEC,FB: principal migrates<br/>installed SAs do not change
+  SEC-->>FB: reporting role moves
+  PRI->>PEER: full SAK-Use<br/>key-state fields = 0<br/>PTx/PRx = shared status
+  FB->>PEER: full SAK-Use<br/>KI, AN, RX/TX, LPN, DP = shared state<br/>PTx/PRx = shared status
+```
+
+SONiC accepts valid SAK-Use on either CKN and uses it for that actor's
+convergence state. Key installation remains limited to a `Distributed SAK`
+validated within its CA.
 
 ### 3.3 Hitless failover
 
 The promotion itself must not disturb the datapath. Control plane and data plane
-are decoupled, so a change of principal does not require the installed SAK to be
-torn down: the SA stays programmed and keeps carrying traffic.
+are decoupled, so changing the principal does not select an old or new SAK
+again. The shared CP and SecY remain in their exact current rollover state.
 
-What moves is **bookkeeping** — the KaY's record of the installed key is re-homed
-from the outgoing participant to the incoming one, so the new principal can
-account for it and retire it later. No SA is created or deleted, and no key
-material crosses between CAs. The new principal does distribute a fresh SAK under
-its own CKN, just not at the instant of promotion: that rekey is deferred until
-MKA has settled (§3.4), and the inherited SA is then rotated out normally.
+What moves is **bookkeeping** — every installed `data_key`, together with the
+current `new_key` and `to_use_sak` state, is re-homed from the outgoing
+participant to the incoming one. No SecY create, enable, disable, or delete
+operation is issued by the ownership change itself. The already-installed SAK
+is not redistributed under the new CAK; its reference moves so the incoming
+principal can manage its subsequent rollover and retirement.
+
+The SAK-Use reporting role swaps before the next MKPDU, as shown above; the
+installed SAs and shared key state do not change.
+
+The SA that remains active depends on how far the CP had progressed when the
+outgoing CA was removed:
+
+| CP phase | State preserved across promotion |
+| -------- | -------------------------------- |
+| Before `CP_RECEIVE` | Only the pre-existing/current SA carries traffic. |
+| `CP_RECEIVE` / `CP_RECEIVING` | The old transmit SA remains active; a receive SA and disabled transmit SA for the new SAK may already exist. |
+| `CP_TRANSMIT` / `CP_TRANSMITTING` | The new transmit SA remains active; the old receive SA remains until retirement. |
+| `CP_ABANDON` | The incomplete latest SAK is deleted and the old SA remains. |
+| `CP_RETIRE` | The old SAK is deleted and the latest SAK becomes the retained old/current SAK. |
+
+Distribution under the deleted CA stops. If the incoming principal is the local
+key server, it distributes a fresh SAK under its own CKN after the settle window
+(§3.4). This is a new ordinary rollover from the state above, not an assumption
+that every interrupted rollover always abandons the latest SAK.
 
 ```mermaid
 sequenceDiagram
@@ -256,7 +314,7 @@ sequenceDiagram
   CAP->>KAY: last live peer times out
   KAY->>KAY: select_principal() <br/>primary has no live peer, <br/>fallback is live → fallback wins
   KAY->>KAY: migrate_principal_sas() <br/>re-home installed-SAK bookkeeping
-  KAY->>CAF: set principal, re-run key server election <br/>(same verdict)
+  KAY->>CAF: set principal, re-run key server election
   Note over SEC: no SA delete / create — <br/>traffic keeps flowing on the inherited SAK
   KAY->>KAY: arm deferred rekey (≈3 × hello time)
 
@@ -269,6 +327,40 @@ sequenceDiagram
   CP->>SEC: make-before-break rollover
 ```
 
+#### 3.3.1 Hitless preconditions and interoperability
+
+The design preserves traffic when all of the following are true:
+
+1. Both endpoints retain at least one **common active SAK** throughout the
+   principal change. This need not be the old SAK if both endpoints have already
+   switched to the latest one.
+2. The fallback CA already has a live peer. If no CA has a live peer, the
+   controlled port is intentionally torn down.
+3. One coherent key server drives both CAs, as described in §3.2.
+4. The physical peer and elected key server use a stable SCI across the two CAs.
+5. A remote key server assigns an AN that permits make-before-break operation on
+   the receiving hardware.
+
+When SONiC is key server, §3.5.1 retains the old receive SA until every live peer
+reports transmission on the latest SAK, subject to a bounded failsafe. When
+SONiC is non-key-server it cannot impose that retention policy on a third-party
+key server; interoperability depends on that implementation also preserving a
+common SAK during rollover.
+
+SONiC raises its key-server priority to `0` when hardware supports fewer than
+four SAs per SC, so it normally controls AN allocation. This is not a guarantee
+of election: a priority tie, SCI tie-break, or an obliged remote key server can
+still leave SONiC as non-key-server. The safe allocator in §3.5.4 protects the
+local key-server path. In the non-key-server path SONiC follows the Distributed
+AN selected by the peer, so constrained-SA interoperability must be validated
+against the peer key server.
+
+The KaY can represent more than one receive SC, keyed by peer SCI. That is not
+equivalent to hitless failover across a peer SCI change. A change in elected
+key-server SCI signals `chgdServer` to the CP, which transitions through
+`CP_CHANGE` and removes the existing SAs. The zero-loss fallback path therefore
+assumes a stable peer/key-server SCI across the primary and fallback CAs.
+
 ### 3.4 Deferred post-promotion rekey
 
 Rekeying *immediately* on promotion is what breaks the datapath: while the two
@@ -280,18 +372,31 @@ The **settle window** is that deferral — the grace period between a change of
 principal and the rekey that follows it, long enough (≈3 hello times, ≈6 s at
 the default 2 s hello) for MKA hellos to converge on both ends.
 
+The window only delays the start of rekey. Once rekey begins, the ordinary CP
+rollover applies, including the peer-confirmation gate in §3.5.1.
+
 Arming is **non-resetting**, so a burst of ownership swaps collapses into a
-single rekey instead of each swap pushing the timer out. A `principal_generation`
-counter distinguishes *"armed, still owned by the same CA"* from *"ownership
-moved again"* — in the latter case the settle window restarts for the new owner.
-An ordinary rekey that lands first cancels the deferral, so the port never
-rotates twice.
+single rekey instead of each swap pushing the timer out. A `principal_changed`
+flag distinguishes *"armed, still owned by the same CA"* from *"ownership moved
+again"* — in the latter case the settle window restarts for the new owner. An
+ordinary rekey that lands first cancels the deferral, so the port never rotates
+twice.
+
+This settle window is an availability-oriented policy for planned or operational
+rotation. It deliberately continues using the inherited SAK while MKA
+converges. If a CAK is suspected to be compromised, any SAK derived through it
+must also be treated as potentially compromised, so extending its use after the
+operator acts is a security tradeoff. The hot-rotation workflow in this design
+does not provide immediate revocation; an emergency policy must choose between
+accepting the settle window or tearing down/rekeying immediately with possible
+traffic interruption. The settle window is fixed at three hello times in this
+change.
 
 ### 3.5 SAK rollover hardening
 
-Running two CAs on one port exposed three latent defects in the rollover path.
-All three are independent of the fallback feature and are worth having on their
-own; two of them are pre-existing bugs in the single-CA case as well.
+Running two CAs on one port exposed four latent defects in the rollover path,
+plus two smaller lifecycle bugs. The rollover fixes are useful independently of
+fallback CAKs and also harden the single-CA case.
 
 #### 3.5.1 Retire the old SA only once every peer has moved
 
@@ -349,19 +454,40 @@ registration lets the next `sm_step()` retry rather than wedging the machine.
 
 #### 3.5.3 Advertise a stable lowest PN
 
-`ieee802_1x_mka_get_lpn()` reports the transmit PN read on the *previous* call and
-then re-reads it, so the two-second lookback required by IEEE Std 802.1X-2010
-Clause 9 only holds if it is called exactly **once per hello interval**. That was
-true with one participant. With several, each participant encoding its own SAK
-Use body re-samples the shared transmit SC, so the first MKPDU of an interval
-advertises a stale PN and the rest advertise one only moments old — and which
-participant sees which depends on list order.
+`ieee802_1x_mka_get_lpn()` uses the PN sampled on the previous hello to provide
+the lookback described by IEEE Std 802.1X-2020 §9. Sampling once per actor would
+shorten that lookback and make it depend on actor order. Only the principal now
+samples and advertises LPN; standby actors send a full SAK-Use body with LPN and
+the other key-state fields zero.
 
-The value to advertise is now sampled **once per interval**, when the principal
-encodes its MKPDU, and every participant reports that snapshot. Sampling cadence
-becomes a property of the port rather than of the number of CAs on it.
+#### 3.5.4 Select an AN that does not replace a live SA
 
-#### 3.5.4 Two smaller fixes
+IEEE Std 802.1X-2020 §9.9 requires the key server to assign ANs in sequence,
+beginning with the first AN after the last SAK in use. A free-running
+`dist_an` counter preserves sequence but loses the required starting point after
+an abandoned distribution or principal change.
+
+That drift is destructive: IEEE Std 802.1AE-2018 §§10.7.13 and 10.7.22 require
+creation of a receive or transmit SA to delete any prior SA at the same AN. An
+incorrectly reused AN can therefore delete the SA that is still carrying
+traffic.
+
+`ieee802_1x_kay_select_dist_an()` chooses explicitly:
+
+1. Start after the most recently installed local SAK.
+2. Skip ANs occupied by the local latest and old SAs
+   (`lki/lan` and `oki/oan`).
+3. Prefer an AN that no live peer reports in SAK Use.
+4. If necessary, reuse an AN reported only by a peer; otherwise a peer that
+   never converges could block rekey indefinitely.
+5. If every local slot is occupied, choose the AN that CP is about to release:
+   the old AN after transmit has moved to the latest SAK, or the incomplete
+   latest AN while transmit remains on the old SAK.
+
+The scan is bounded by the hardware's configured maximum SAs per SC and by the
+two-bit AN field.
+
+#### 3.5.5 Two smaller fixes
 
 - **Transmit SC leak.** `ieee802_1x_kay_create_mka()` creates the transmit SC in
   the SecY before deriving the KEK and ICK. If either derivation failed, the
@@ -452,10 +578,12 @@ port in between:
 2. `macsec_add_mka` the new primary. Once it has a live peer, rule 1 applies —
    the primary outranks the fallback — and selection returns the port to it.
 
-Each step costs one settle window of a few hello times, but no packet loss, and
-the port is never left without a usable CA. Note the peer does **not** have to
-have installed the new CKN before the old one is removed — the fallback covers
-the gap, which is what makes an uncoordinated, one-end-at-a-time rotation safe.
+Each ownership change can trigger a settle window of a few hello times. Subject
+to the interoperability preconditions in §3.3.1, the inherited SAK carries
+traffic during that window and the port is never left without a usable CA. The
+peer does **not** have to have installed the new CKN before the old one is
+removed — the fallback covers the gap, which is what makes an uncoordinated,
+one-end-at-a-time planned rotation possible.
 
 These are supplicant-level primitives, not an operator workflow. MACsecMgr
 issues the sequence; an operator uses the ordinary SONiC config commands and
@@ -470,6 +598,10 @@ Because the two intents map to different command streams, the supplicant never
 has to infer which was meant: a bare `macsec_del_mka` is *never* a teardown
 request. It removes one CA and the KaY keeps the port on whatever remains. The
 Controlled Port is torn down only when the port's last CA goes away.
+
+This sequence is intended for planned rotation. It is not an immediate
+revocation primitive for a compromised CAK because it intentionally retains the
+inherited SAK during the settle window (§3.4).
 
 ```mermaid
 sequenceDiagram
@@ -518,7 +650,9 @@ building blocks for a future *hot* key-rotation flow in MACsecMgr (an update to
 `primary_cak` on an already-running profile applied without a link bounce). Such
 a flow must follow the delete-then-add ordering of §4.2, and requires a fallback
 CAK to be configured — without one, the port has no CA to carry traffic between
-the two steps. That flow is out of scope for this document.
+the two steps. A companion MACsecMgr/configuration HLD will define the operator
+commands, CONFIG\_DB update handling, sequencing, and failure recovery for that
+flow; those changes are out of scope for this document.
 
 ## 6 Backward compatibility
 
@@ -527,6 +661,9 @@ the two steps. That flow is out of scope for this document.
   previous behaviour.
 - No SONiC MACsec plugin API changed, so no MACsecOrch or SAI change is implied.
 - No CONFIG\_DB / APP\_DB / STATE\_DB schema change.
+- A principal change does not recreate an SC or SA, so it does not reset SAI
+  counters. The deferred SAK rollover has the same counter lifecycle as an
+  ordinary rekey.
 - The `MACSEC` status output gains `is_principal` and `is_primary` per
   participant and now reports secure channels once for the port rather than once
   per participant. Existing fields keep their names and meanings.
@@ -545,25 +682,14 @@ the two steps. That flow is out of scope for this document.
 | 8 | Both CAKs invalid | Controlled port torn down; recovers when either becomes valid |
 | 9 | Long soak with periodic rekey | No SC/SA leak in the driver; refcounts return to zero on teardown |
 | 10 | `macsec_add_mka` for a second primary while one is present | Rejected with `FAIL`; the existing CA set and port ownership are unchanged |
+| 11 | Delete the principal during each CP rollover phase | The currently active transmit SA remains active; latest/old SAs are abandoned or retired according to CP state; no drops |
+| 12 | Two-SA hardware with SONiC as key server | AN selection does not replace a locally active SA; rollover remains hitless |
+| 13 | Two-SA hardware with SONiC as non-key-server | Peer-selected AN permits make-before-break; document peer combinations for which this is verified |
+| 14 | Peer uses a different SCI on fallback | Separate receive SC is created, but `chgdServer` resets CP; scenario is not claimed as hitless |
+| 15 | Deliberately inconsistent per-CA key-server election | Split-key-server operation is unsupported; no zero-loss convergence is claimed |
+| 16 | SAK-Use with both CAs live and during migration | Both CKNs send full bodies; only the principal has nonzero key state; standby reports PTx/PRx; roles swap atomically |
+| 17 | Counters across principal migration and deferred rekey | No counter reset at principal migration; later counter behavior matches an ordinary SAK rekey |
 
 Loss measurement should be a continuous bidirectional stream across the link for
-scenarios 3–7; the pass criterion is zero dropped frames.
-
-## 8 Patch series
-
-The change is submitted as eight self-contained, sequentially applicable
-commits:
-
-| # | Commit | Purpose |
-| - | ------ | ------- |
-| 1 | fix transmit SC leak when creating an MKA participant fails | pre-existing bug fix |
-| 2 | do not reject a SAK Use from a not-yet-live peer | pre-existing bug fix |
-| 3 | move per-port SecY state from the participant to the KaY | refactor, no functional change |
-| 4 | support a fallback CAK with automatic failover | the feature |
-| 5 | defer the rekey that follows a principal promotion | hitless promotion |
-| 6 | coalesce the deferred CP state machine step | rollover hardening |
-| 7 | retire the old SA only once every peer transmits on the new SAK | rollover hardening |
-| 8 | advertise a stable lowest PN per MKA hello interval | rollover hardening |
-
-Commits 1, 2, 6, 7 and 8 are candidates for upstream `hostap` independently of
-the fallback feature.
+scenarios 3–7 and 11–13; the pass criterion is zero dropped frames for the peer
+and hardware combinations declared interoperable.
